@@ -1,7 +1,10 @@
 // Audio subsystem for the brick-breaker game.
 // - SFX are synthesized on demand with the Web Audio API (no audio assets).
-// - Music uses HTMLAudioElement with crossfade. Missing files degrade silently.
+// - Music: procedural chiptune loops by default; optional MP3s override when present.
 // - The AudioContext is created lazily to avoid autoplay-policy warnings.
+
+import { MUSIC_TRACKS } from './musicTracks.js';
+import { MusicSynth } from './musicSynth.js';
 
 export class AudioSystem {
   constructor() {
@@ -16,6 +19,9 @@ export class AudioSystem {
     this._tracks = new Map();
     this._currentKey = null;
     this._fadeTimers = new Map(); // key -> intervalId
+    this._musicBus = null;
+    this._musicSynth = null;
+    this._musicSource = 'none'; // 'file' | 'synth' | 'none'
 
     // Pending music: if playMusic() called before unlock(), remember the
     // request and start once the user gesture happens.
@@ -29,6 +35,7 @@ export class AudioSystem {
   unlock() {
     try {
       this._ensureContext();
+      this._ensureMusicBus();
       if (this._ctx && typeof this._ctx.resume === 'function') {
         // resume returns a promise; ignore errors
         const p = this._ctx.resume();
@@ -66,6 +73,53 @@ export class AudioSystem {
     return this._ctx;
   }
 
+  _ensureMusicBus() {
+    if (!this._ctx || this._musicBus) return;
+    try {
+      this._musicBus = this._ctx.createGain();
+      this._musicBus.gain.value = this._muted ? 0 : this._musicVolume;
+      this._musicBus.connect(this._ctx.destination);
+      this._musicSynth = new MusicSynth(this._ctx, this._musicBus);
+    } catch (_) {
+      this._musicBus = null;
+      this._musicSynth = null;
+    }
+  }
+
+  _fileTrackReady(key) {
+    const entry = this._tracks.get(key);
+    return !!(entry && entry.audio && entry.loaded && !entry.failed);
+  }
+
+  _applyMusicOutputVolume() {
+    const v = this._muted ? 0 : this._musicVolume;
+    try {
+      if (this._musicBus && this._ctx) {
+        this._musicBus.gain.setTargetAtTime(v, this._ctx.currentTime, 0.05);
+      }
+    } catch (_) {}
+    try {
+      if (this._musicSource === 'file' && this._currentKey) {
+        const track = this._tracks.get(this._currentKey);
+        if (track?.audio) track.audio.volume = v;
+      }
+    } catch (_) {}
+  }
+
+  _stopFileMusic(fadeMs = 0) {
+    const key = this._musicSource === 'file' ? this._currentKey : null;
+    if (!key) return;
+    const track = this._tracks.get(key);
+    if (!track?.audio) return;
+    this._fadeTo(key, 0, fadeMs, () => {
+      try { track.audio.pause(); } catch (_) {}
+    });
+  }
+
+  _stopSynthMusic(fadeMs = 0) {
+    try { this._musicSynth?.stop(fadeMs); } catch (_) {}
+  }
+
   // ---------------- Mute / volume ----------------
 
   setMuted(b) {
@@ -75,15 +129,7 @@ export class AudioSystem {
         this._masterGain.gain.setTargetAtTime(this._muted ? 0 : 1, this._ctx.currentTime, 0.01);
       }
     } catch (_) {}
-    // Apply to currently playing music
-    try {
-      if (this._currentKey) {
-        const track = this._tracks.get(this._currentKey);
-        if (track && track.audio) {
-          track.audio.volume = this._muted ? 0 : this._musicVolume;
-        }
-      }
-    } catch (_) {}
+    this._applyMusicOutputVolume();
   }
 
   toggleMute() {
@@ -97,14 +143,7 @@ export class AudioSystem {
     if (v < 0) v = 0;
     if (v > 1) v = 1;
     this._musicVolume = v;
-    try {
-      if (this._currentKey) {
-        const track = this._tracks.get(this._currentKey);
-        if (track && track.audio) {
-          track.audio.volume = this._muted ? 0 : this._musicVolume;
-        }
-      }
-    } catch (_) {}
+    this._applyMusicOutputVolume();
   }
 
   // ---------------- Music ----------------
@@ -140,61 +179,75 @@ export class AudioSystem {
 
   playMusic(trackKey, fadeMs) {
     const fade = (typeof fadeMs === 'number' && fadeMs >= 0) ? fadeMs : 600;
-    if (!this._tracks.has(trackKey)) {
-      // Track not loaded — silently ignore so missing files don't crash.
-      return;
-    }
-    if (this._currentKey === trackKey) return;
+    const hasFile = this._tracks.has(trackKey);
+    const hasSynth = trackKey in MUSIC_TRACKS;
+    if (!hasFile && !hasSynth) return;
+    if (this._currentKey === trackKey && this._musicSource !== 'none') return;
 
-    // If we don't yet have a user gesture, defer. We'll start on unlock().
     if (!this._unlocked) {
       this._pendingPlay = { key: trackKey, fadeMs: fade };
       return;
     }
 
-    const next = this._tracks.get(trackKey);
-    if (!next || !next.audio || next.failed) return;
+    this._ensureMusicBus();
+    const prevKey = this._currentKey;
+    const prevSource = this._musicSource;
+    if (prevKey && prevKey !== trackKey) {
+      if (prevSource === 'file') this._stopFileMusic(fade);
+      if (prevSource === 'synth') this._stopSynthMusic(fade);
+    }
 
-    // Begin playback of the new track at volume 0, then fade in.
-    try {
-      next.audio.currentTime = 0;
-    } catch (_) {}
+    const target = this._muted ? 0 : this._musicVolume;
+
+    if (this._fileTrackReady(trackKey)) {
+      this._playMusicFile(trackKey, fade, target);
+      return;
+    }
+
+    if (this._musicSynth?.play(trackKey, fade)) {
+      this._musicSource = 'synth';
+      this._currentKey = trackKey;
+      this._applyMusicOutputVolume();
+      return;
+    }
+
+    this._musicSource = 'none';
+    this._currentKey = null;
+  }
+
+  _playMusicFile(trackKey, fade, target) {
+    const next = this._tracks.get(trackKey);
+    if (!next?.audio) return;
+    this._stopSynthMusic(0);
+
+    try { next.audio.currentTime = 0; } catch (_) {}
     next.audio.volume = 0;
     const playPromise = (() => {
       try { return next.audio.play(); } catch (_) { return null; }
     })();
     if (playPromise && typeof playPromise.catch === 'function') {
-      playPromise.catch(() => { /* autoplay blocked or file missing */ });
+      playPromise.catch(() => {
+        next.failed = true;
+        if (this._currentKey === trackKey) {
+          this._musicSource = 'none';
+          this._currentKey = null;
+        }
+        this.playMusic(trackKey, fade);
+      });
     }
 
-    const target = this._muted ? 0 : this._musicVolume;
     this._fadeTo(trackKey, target, fade);
-
-    // Fade out and pause the previous track.
-    const prevKey = this._currentKey;
-    if (prevKey && prevKey !== trackKey) {
-      const prev = this._tracks.get(prevKey);
-      if (prev && prev.audio) {
-        this._fadeTo(prevKey, 0, fade, () => {
-          try { prev.audio.pause(); } catch (_) {}
-        });
-      }
-    }
-
+    this._musicSource = 'file';
     this._currentKey = trackKey;
   }
 
   stopMusic(fadeMs) {
     const fade = (typeof fadeMs === 'number' && fadeMs >= 0) ? fadeMs : 600;
     this._pendingPlay = null;
-    const key = this._currentKey;
+    if (this._musicSource === 'file') this._stopFileMusic(fade);
+    if (this._musicSource === 'synth') this._stopSynthMusic(fade);
+    this._musicSource = 'none';
     this._currentKey = null;
-    if (!key) return;
-    const track = this._tracks.get(key);
-    if (!track || !track.audio) return;
-    this._fadeTo(key, 0, fade, () => {
-      try { track.audio.pause(); } catch (_) {}
-    });
   }
 
   _fadeTo(key, targetVol, durationMs, onDone) {

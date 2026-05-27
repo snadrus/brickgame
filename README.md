@@ -84,4 +84,4 @@ A real-Chromium headless test (puppeteer) was used during development to confirm
 
 ## Music
 
-The music files in `assets/music/` are NOT bundled with the source. The audio system gracefully handles missing files — the game works fine in silence. To add background music, see `assets/music/README.md` for sourcing instructions and `ATTRIBUTION.md` for the credits template.
+Background music is **built in** (procedural chiptune loops via Web Audio). After you click **Start**, music should play automatically. To use your own MP3s instead, drop files into `assets/music/` (see `assets/music/README.md`); loaded files override the synth for that track.

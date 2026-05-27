@@ -179,10 +179,12 @@ test('sprites returns a canvas-like object for each variant', () => {
 });
 
 const audioMod = await import('../src/audio.js');
+
 test('audio system instantiates and SFX do not throw', () => {
   const a = new audioMod.AudioSystem();
   a.loadMusic({ title: 'assets/music/title.mp3', 'level-1': 'assets/music/level-1.mp3' });
   a.unlock();
+  const webAudio = !!a._ctx;
   for (const name of ['paddleHit','wallHit','brickHit','brickBreak','powerUp','powerDown','laserShoot','loseLife','levelClear','launch']) {
     a.sfx(name);
   }
@@ -191,7 +193,24 @@ test('audio system instantiates and SFX do not throw', () => {
   a.setMuted(false);
   a.toggleMute();
   a.playMusic('title', 100);
+  if (webAudio) {
+    assert(a._musicSource === 'synth' || a._musicSource === 'file', 'music started');
+  }
   a.stopMusic(100);
+});
+
+test('procedural music plays without MP3 files', () => {
+  const a = new audioMod.AudioSystem();
+  a.loadMusic({});
+  a.unlock();
+  if (!a._ctx) {
+    console.log('    (skip: no AudioContext in this runtime)');
+    return;
+  }
+  a.playMusic('level-1', 50);
+  assert(a._musicSource === 'synth', `expected synth, got ${a._musicSource}`);
+  assert(a._musicSynth?.playing, 'synth loop running');
+  a.stopMusic(50);
 });
 
 const levels = await import('../src/levels.js');
